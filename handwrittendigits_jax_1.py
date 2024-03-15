@@ -1,4 +1,4 @@
-# MNIST using JAX, using grad
+# MNIST using JAX, using grad / jvp
 
 import jax.numpy as jnp
 from jax import grad, jit, vmap, random, jvp
