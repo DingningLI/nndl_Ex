@@ -36,7 +36,7 @@ def init_network_params(sizes, key, scale):
     return [random_layer_params(m, n, k, scale) for m, n, k in zip(sizes[:-1], sizes[1:], keys)]
 
 key, init_key = random.split(key)  # init_key used for initialization
-sizes = [784, 30, 10]
+sizes = [784, 100, 10]
 params = init_network_params(sizes, init_key, 0.001)
 
 def set_value(x, value):
@@ -67,8 +67,8 @@ test_data = datasets.MNIST(
 train_dataloader = data.DataLoader(training_data, shuffle=True, batch_size=batch_size, collate_fn=numpy_collate)
 # test_dataloader = data.DataLoader(test_data, batch_size=batch_size, collate_fn=numpy_collate)
 
-# train_images = np.array(training_data.data).reshape(len(training_data.data), -1)
-# train_labels = one_hot(np.array(training_data.targets), n_targets)
+train_images = np.array(training_data.data).reshape(len(training_data.data), -1)
+train_labels = one_hot(np.array(training_data.targets), n_targets)
 test_images = jnp.array(test_data.data.numpy().reshape(len(test_data.data), -1), dtype=jnp.float32)
 test_labels = one_hot(np.array(test_data.targets), n_targets)
 
@@ -92,23 +92,70 @@ def update(params, inputs, target):
 
 # I use a loop here because I don't know how to do vmap_JVP;
 # another good thing is that this matches with the physical implementation.
-def wf_estimator(params, inputs, target, key, num): # weight perturbed forward-AD, following (Baydin et al., 2022);
+def wf_estimator(params, inputs, target, key, num, fine_tune): # weight perturbed forward-AD, following (Baydin et al., 2022);
     # num is the number of random vevtors chosen to calculate the average of JVP.
     f = lambda params: loss(params, inputs, target) # Isolate the function from the weight matrix to the predictions
     # create a pytree of all 0's to store the vector (actually a pytree) for estimated grad vec
     jvpv_vec = tree_map(lambda x: set_value(x, 0), params)
     key, *num_init_keys = random.split(key, num = num+1)
-    for sub_init_key in num_init_keys:
-        v = init_network_params(sizes, sub_init_key, 1.0) # update at each iteration
-        jvp_val = jvp(f, (params,), (v,))[1]
-        jvp_val_pytree = tree_map(lambda x: set_value(x, jvp_val), params)
-        jvp_vec_ = tree_map(lambda x, y: x*y, jvp_val_pytree, v)
-        jvpv_vec = tree_map(lambda x, y: x+y, jvpv_vec, jvp_vec_)
-    jvpv_vec = tree_map(lambda x: x / num, jvpv_vec) # averaged over the numbers
+    if fine_tune == 0:
+        for sub_init_key in num_init_keys:
+            v = init_network_params(sizes, sub_init_key, 1.0) # update at each iteration
+            jvp_val = jvp(f, (params,), (v,))[1]
+            jvp_val_pytree = tree_map(lambda x: set_value(x, jvp_val), params) # increase the dim of jvp by copying its values to a pytree, same structure as params
+            jvp_vec_ = tree_map(lambda x, y: x*y, jvp_val_pytree, v)
+            jvpv_vec = tree_map(lambda x, y: x+y, jvpv_vec, jvp_vec_)
+        jvpv_vec = tree_map(lambda x: x / num, jvpv_vec) # averaged over the numbers
+    else:
+        # Pick out the non-zero / large directional derivatives, 
+        # and use only them (not the whole batch of random vector) to update the params.
+        # Note that it is NOT estimating the grad anymore.
+        id = 0
+        v_ = []
+        jvp_val_arr = np.zeros(num) # note that it is an numpy array, because jnp array is immutable
+        for sub_init_key in num_init_keys: # same as before
+            v = init_network_params(sizes, sub_init_key, 1.0)
+            jvp_val_arr[id] = jvp(f, (params,), (v,))[1]
+            v_.append(v)
+            id += 1
+        jvp_val_arr_id = np.argsort(jvp_val_arr) # sorted indices of jvp_val_arr
+        for i in jvp_val_arr_id[-fine_tune:]: # recover v and jvp_val, then same as before
+            v = v_[i]
+            jvp_val = jvp_val_arr[i]
+            jvp_val_pytree = tree_map(lambda x: set_value(x, jvp_val), params)
+            jvp_vec_ = tree_map(lambda x, y: x*y, jvp_val_pytree, v)
+            jvpv_vec = tree_map(lambda x, y: x+y, jvpv_vec, jvp_vec_)
+        jvpv_vec = tree_map(lambda x: x / fine_tune, jvpv_vec) # averaged over the numbers
     return key, jvpv_vec # return the pytree of grad vecs
 
-def wf_update(params, inputs, target, key, num):
-    new_key, es_grads = wf_estimator(params, inputs, target, key, num) # estimated grad vecs
+# Pick out the non-zero / large directional derivatives, 
+# and use only them (not the whole batch of random vector) to update the params.
+# Note that it is NOT estimating the grad anymore.
+# def wf_estimator_finetune(params, inputs, target, key, num, num_pick): # weight perturbed forward-AD, following (Baydin et al., 2022);
+#     # num is the number of random vevtors chosen to calculate the average of JVP.
+#     f = lambda params: loss(params, inputs, target) # Isolate the function from the weight matrix to the predictions
+#     # create a pytree of all 0's to store the vector (actually a pytree) for estimated grad vec
+#     jvpv_vec = tree_map(lambda x: set_value(x, 0), params)
+#     key, *num_init_keys = random.split(key, num = num+1)
+#     id = 0
+#     v_ = []
+#     jvp_val_arr = np.zeros(num) # note that it is an numpy array, because jnp array is immutable
+#     for sub_init_key in num_init_keys:
+#         v = init_network_params(sizes, sub_init_key, 1.0)
+#         jvp_val_arr[id] = jvp(f, (params,), (v,))[1]
+#         v_.append(v)
+#         id += 1
+#     jvp_val_arr_id = np.argsort(jvp_val_arr) # sorted indices of jvp_val_arr
+#     for i in jvp_val_arr_id[-num_pick:]:
+#         v = v_[i]
+#         jvp_val = jvp_val_arr[i]
+#         jvp_val_pytree = tree_map(lambda x: set_value(x, jvp_val), params) # same as before
+#         jvp_vec_ = tree_map(lambda x, y: x*y, jvp_val_pytree, v)
+#         jvpv_vec = tree_map(lambda x, y: x+y, jvpv_vec, jvp_vec_)
+#     return key, jvpv_vec # return the pytree of grad vecs
+
+def wf_update(params, inputs, target, key, num, fine_tune):
+    new_key, es_grads = wf_estimator(params, inputs, target, key, num, fine_tune) # estimated grad vecs
     return new_key, tree_map(lambda p, g: p - learning_rate * g / batch_size, params, es_grads)
 
 def accuracy(params, images, targets):
@@ -116,27 +163,50 @@ def accuracy(params, images, targets):
     predicted_class = jnp.argmax(batched_predict(params, images), axis=1)
     return jnp.mean(predicted_class == target_class)
 
-for epoch in range(num_epochs):
-    print(f"Epoch {epoch+1}\n-------------------------------")
-    for idx, (x, y) in enumerate(train_dataloader):
-        y = one_hot(y, n_targets)
-        params = update(params, x, y)
-        if idx % 200 == 0:  # evaluation
-            # train_acc = accuracy(params, train_images, train_labels)
-            # print("Training set accuracy {}".format(train_acc))
-            test_acc = accuracy(params, test_images, test_labels)
-            test_loss = loss(params, test_images, test_labels)
-            print("Test set accuracy {}, Test set loss {}".format(test_acc, test_loss))
+# for epoch in range(num_epochs):
+#     print(f"Epoch {epoch+1}\n-------------------------------")
+#     for idx, (x, y) in enumerate(train_dataloader):
+#         y = one_hot(y, n_targets)
+#         params = update(params, x, y)
+#         if idx % 200 == 0:  # evaluation
+#             # train_acc = accuracy(params, train_images, train_labels)
+#             # print("Training set accuracy {}".format(train_acc))
+#             test_acc = accuracy(params, test_images, test_labels)
+#             test_loss = loss(params, test_images, test_labels)
+#             print("Test set accuracy {}, Test set loss {}".format(test_acc, test_loss))
 
 # for epoch in range(num_epochs):
 #     print(f"Epoch {epoch+1}\n-------------------------------")
 #     for idx, (x, y) in enumerate(train_dataloader):
 #         y = one_hot(y, n_targets)
-#         key, params = wf_update(params, x, y, key, 100)
-#         if idx % 10 == 0:  # evaluation
-#             # train_acc = accuracy(params, train_images, train_labels)
-#             # print("Training set accuracy {}".format(train_acc))
+#         key, params = wf_update(params, x, y, key, 100, 0)
+#         if idx % 100 == 0:  # evaluation
+#             train_acc = accuracy(params, train_images, train_labels)
+#             train_loss = loss(params, train_images, train_labels)
+#             print("Training set accuracy {}, Training set loss {}".format(train_acc, train_loss))
 #             test_acc = accuracy(params, test_images, test_labels)
 #             test_loss = loss(params, test_images, test_labels)
 #             print("Test set accuracy {}, Test set loss {}".format(test_acc, test_loss))    
-        
+
+print(f"Epoch 1\n-------------------------------")
+for idx, (x, y) in enumerate(train_dataloader):
+    y = one_hot(y, n_targets)
+    key, params = wf_update(params, x, y, key, 200, 100)
+    if idx % 20 == 0:  # evaluation
+        train_acc = accuracy(params, train_images, train_labels)
+        train_loss = loss(params, train_images, train_labels)
+        print("Training set accuracy {}, Training set loss {}".format(train_acc, train_loss))
+        test_acc = accuracy(params, test_images, test_labels)
+        test_loss = loss(params, test_images, test_labels)
+        print("Test set accuracy {}, Test set loss {}".format(test_acc, test_loss))    
+print(f"Epoch 2\n-------------------------------")
+for idx, (x, y) in enumerate(train_dataloader):
+    y = one_hot(y, n_targets)
+    key, params = wf_update(params, x, y, key, 200, 0)
+    if idx % 20 == 0:  # evaluation
+        train_acc = accuracy(params, train_images, train_labels)
+        train_loss = loss(params, train_images, train_labels)
+        print("Training set accuracy {}, Training set loss {}".format(train_acc, train_loss))
+        test_acc = accuracy(params, test_images, test_labels)
+        test_loss = loss(params, test_images, test_labels)
+        print("Test set accuracy {}, Test set loss {}".format(test_acc, test_loss))    
